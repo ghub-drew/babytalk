@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "server.js",
+      "use": "@vercel/node"
+    },
+    {
+      "src": "public/**",
+      "use": "@vercel/static"
+    }
+  ],
+  "routes": [
+    { "src": "/health", "dest": "server.js" },
+    { "src": "/credits", "dest": "server.js" },
+    { "src": "/create-checkout", "dest": "server.js" },
+    { "src": "/generate", "dest": "server.js" },
+    { "src": "/status/(.*)", "dest": "server.js" },
+    { "src": "/webhook", "dest": "server.js" },
+    { "src": "/(.*)", "dest": "public/$1" }
+  ]
+}
