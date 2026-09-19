@@ -4,14 +4,12 @@ const cors = require('cors');
 const multer = require('multer');
 const fetch = require('node-fetch');
 const FormData = require('form-data');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const crypto = require('crypto');
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 // ─── In-memory credit store ───────────────────────────────────────────────────
-// For production, replace with a real database (Supabase, MongoDB, etc.)
-// Key: sessionId, Value: { credits: number, usedAt: Date }
 const creditStore = new Map();
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
@@ -21,34 +19,52 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'x-session-id']
 }));
 
-// ─── Stripe webhook (must be before express.json()) ──────────────────────────
-app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-  const sig = req.headers['stripe-signature'];
-  let event;
-
+// ─── PayMongo webhook ─────────────────────────────────────────────────────────
+app.post('/webhook', express.json(), async (req, res) => {
   try {
-    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    const event = req.body;
+
+    // Verify webhook signature
+    const webhookSecret = process.env.PAYMONGO_WEBHOOK_SECRET;
+    if (webhookSecret) {
+      const signature = req.headers['paymongo-signature'];
+      if (signature) {
+        const parts = signature.split(',').reduce((acc, part) => {
+          const [key, val] = part.split('=');
+          acc[key] = val;
+          return acc;
+        }, {});
+        const payload = parts.t + '.' + JSON.stringify(req.body);
+        const computedSig = crypto.createHmac('sha256', webhookSecret).update(payload).digest('hex');
+        if (computedSig !== parts.te && computedSig !== parts.li) {
+          return res.status(400).json({ error: 'Invalid signature' });
+        }
+      }
+    }
+
+    // Handle successful payment
+    if (event.data?.attributes?.type === 'payment.paid' ||
+        event.data?.attributes?.type === 'checkout_session.payment.paid') {
+      const metadata = event.data?.attributes?.data?.attributes?.metadata ||
+                       event.data?.attributes?.metadata || {};
+      const sessionId = metadata.sessionId;
+      const quantity = parseInt(metadata.quantity || '1');
+
+      if (sessionId) {
+        const existing = creditStore.get(sessionId) || { credits: 0 };
+        creditStore.set(sessionId, {
+          credits: existing.credits + quantity,
+          lastUpdated: new Date()
+        });
+        console.log(`PayMongo payment complete: ${quantity} credit(s) added for session ${sessionId}`);
+      }
+    }
+
+    res.json({ received: true });
   } catch (err) {
-    console.error('Webhook signature failed:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+    console.error('Webhook error:', err);
+    res.status(500).json({ error: err.message });
   }
-
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object;
-    const sessionId = session.metadata.sessionId;
-    const quantity = parseInt(session.metadata.quantity || '1');
-
-    // Add credits to the session
-    const existing = creditStore.get(sessionId) || { credits: 0 };
-    creditStore.set(sessionId, {
-      credits: existing.credits + quantity,
-      lastUpdated: new Date()
-    });
-
-    console.log(`Payment complete: ${quantity} credit(s) added for session ${sessionId}`);
-  }
-
-  res.json({ received: true });
 });
 
 app.use(express.json());
@@ -58,37 +74,59 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// ─── Create Stripe checkout session ──────────────────────────────────────────
+// ─── Create PayMongo checkout session ────────────────────────────────────────
 app.post('/create-checkout', async (req, res) => {
   try {
     const { sessionId, quantity = 1 } = req.body;
-
     if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
 
     const pricePerVideo = parseInt(process.env.PRICE_PER_VIDEO_CENTS || '500');
     const totalAmount = pricePerVideo * quantity;
 
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
-      line_items: [{
-        price_data: {
-          currency: 'usd',
-          product_data: {
-            name: `BabyTalk Video${quantity > 1 ? 's' : ''}`,
-            description: `${quantity} personalized baby lip-sync video${quantity > 1 ? 's' : ''}`,
-            images: []
-          },
-          unit_amount: pricePerVideo
-        },
-        quantity
-      }],
-      mode: 'payment',
-      success_url: `${process.env.FRONTEND_URL || 'http://localhost:3000'}?payment=success&session=${sessionId}`,
-      cancel_url: `${process.env.FRONTEND_URL || 'http://localhost:3000'}?payment=cancelled`,
-      metadata: { sessionId, quantity: String(quantity) }
+    // PayMongo uses centavos (PHP) or cents (USD) — amounts in smallest currency unit
+    const paymongoKey = process.env.PAYMONGO_SECRET_KEY;
+    const authHeader = 'Basic ' + Buffer.from(paymongoKey + ':').toString('base64');
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+
+    const response = await fetch('https://api.paymongo.com/v1/checkout_sessions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': authHeader
+      },
+      body: JSON.stringify({
+        data: {
+          attributes: {
+            billing: { name: 'BabyTalk Customer' },
+            send_email_receipt: true,
+            show_description: true,
+            show_line_items: true,
+            line_items: [{
+              currency: 'PHP',
+              amount: totalAmount,
+              name: `BabyTalk Video${quantity > 1 ? 's' : ''}`,
+              description: `${quantity} personalized baby lip-sync video${quantity > 1 ? 's' : ''}`,
+              quantity
+            }],
+            payment_method_types: ['card', 'gcash', 'maya'],
+            success_url: `${frontendUrl}?payment=success&session=${sessionId}`,
+            cancel_url: `${frontendUrl}?payment=cancelled`,
+            metadata: { sessionId, quantity: String(quantity) }
+          }
+        }
+      })
     });
 
-    res.json({ checkoutUrl: session.url });
+    const data = await response.json();
+
+    if (!response.ok) {
+      const errMsg = data?.errors?.[0]?.detail || 'Failed to create checkout';
+      throw new Error(errMsg);
+    }
+
+    const checkoutUrl = data.data?.attributes?.checkout_url;
+    res.json({ checkoutUrl });
+
   } catch (err) {
     console.error('Checkout error:', err);
     res.status(500).json({ error: err.message });
